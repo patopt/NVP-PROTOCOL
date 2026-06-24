@@ -1,0 +1,76 @@
+name: macOS App
+
+# Builds the NVP Worker macOS app (unsigned .app, zipped) on a macOS runner.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "macos/**"
+      - ".github/workflows/macos-app.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      SCHEME: NVPMac
+      PROJECT: macos/NVPMac.xcodeproj
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: macos
+        run: xcodegen generate
+
+      - name: Cache SwiftPM + DerivedData
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/dd/SourcePackages
+            ~/dd/Build
+          key: ${{ runner.os }}-macapp-${{ hashFiles('macos/project.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-macapp-
+
+      - name: Resolve Swift packages
+        working-directory: macos
+        run: xcodebuild -project NVPMac.xcodeproj -scheme "$SCHEME" -derivedDataPath "$HOME/dd" -resolvePackageDependencies
+
+      - name: Build app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$HOME/dd" \
+            -skipPackagePluginValidation \
+            build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Package .app
+        run: |
+          set -euo pipefail
+          APP="$HOME/dd/Build/Products/Debug/NVPMac.app"
+          if [ ! -d "$APP" ]; then echo "App not found"; ls -R "$HOME/dd/Build/Products" || true; exit 1; fi
+          (cd "$(dirname "$APP")" && ditto -c -k --sequesterRsrc --keepParent "NVPMac.app" "$RUNNER_TEMP/NVPMac-macos.zip")
+          echo "Built $(du -h "$RUNNER_TEMP/NVPMac-macos.zip" | cut -f1)"
+
+      - name: Upload macOS app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvp-macos-app
+          path: ${{ runner.temp }}/NVPMac-macos.zip
+          if-no-files-found: error
