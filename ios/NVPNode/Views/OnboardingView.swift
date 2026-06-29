@@ -5,6 +5,7 @@ struct OnboardingView: View {
     @State private var busy = false
     @State private var showRestore = false
     @State private var restoreText = ""
+    @State private var coordinatorURL = Config.coordinatorURL
 
     var body: some View {
         VStack(spacing: 24) {
@@ -25,6 +26,19 @@ struct OnboardingView: View {
             .card()
             .padding(.horizontal)
 
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Coordinator URL").font(.caption).foregroundColor(Theme.muted)
+                TextField("https://your-app.vercel.app", text: $coordinatorURL)
+                    .textInputAutocapitalization(.never).keyboardType(.URL).autocorrectionDisabled()
+                    .padding().background(Theme.bg.opacity(0.4))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .foregroundColor(Theme.text)
+                Text("Enter your deployed coordinator (Vercel) URL, then Get started.")
+                    .font(.caption2).foregroundColor(Theme.muted)
+            }
+            .padding(.horizontal)
+
             if let err = app.errorMessage {
                 Text(err).foregroundColor(Theme.red).font(.footnote).padding(.horizontal)
             }
@@ -32,9 +46,19 @@ struct OnboardingView: View {
             VStack(spacing: 10) {
                 Button {
                     busy = true
-                    Task { await app.register(); busy = false }
+                    Task {
+                        let url = coordinatorURL.trimmingCharacters(in: .whitespaces)
+                        Config.coordinatorURL = url
+                        app.rebuildClient()
+                        if await app.checkHealth() {
+                            await app.register()
+                        } else {
+                            app.errorMessage = "Cannot reach the coordinator at \(url). Check the URL is deployed."
+                        }
+                        busy = false
+                    }
                 } label: {
-                    Text(busy ? "Setting up…" : "Get started")
+                    Text(busy ? "Connecting…" : "Get started")
                         .bold().frame(maxWidth: .infinity).padding()
                         .background(Theme.accent).foregroundColor(Theme.onAccent)
                         .clipShape(RoundedRectangle(cornerRadius: 14))
@@ -45,9 +69,6 @@ struct OnboardingView: View {
                     .font(.footnote).foregroundColor(Theme.gold)
             }
             .padding(.horizontal)
-
-            Text("Coordinator: \(Config.coordinatorURL)")
-                .font(.caption2).foregroundColor(Theme.muted)
             Spacer()
         }
         .sheet(isPresented: $showRestore) {

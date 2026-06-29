@@ -19,7 +19,19 @@ struct ModelDTO: Decodable, Identifiable {
 
 struct ModelsResponse: Decodable { let models: [ModelDTO] }
 
-struct JobParams: Decodable { let maxTokens: Int? }
+struct JobParams: Decodable {
+    let maxTokens: Int?
+    let reasoning: Bool?
+    /// OpenClaw (NVP Studio) agent task — the device runs the agent loop locally.
+    let openclaw: Bool?
+    let personality: String?
+    let web: Bool?
+    /// Name/id of the Studio instance this job belongs to (worker visibility).
+    let instance: String?
+    let instanceId: String?
+    /// Image-generation task — the device runs Stable Diffusion (Core ML).
+    let imagegen: Bool?
+}
 
 struct Job: Decodable {
     let jobId: String
@@ -75,6 +87,11 @@ struct StatsDTO: Decodable {
     let combinedTops: Int
     let liveTokensPerSec: Double
     let jobsDone: Int
+}
+
+struct SettingsDTO: Decodable {
+    let nvpSplitEnabled: Bool
+    let walletBetaEnabled: Bool
 }
 
 enum APIError: Error, LocalizedError {
@@ -202,24 +219,65 @@ final class APIClient {
         try await run(try makeRequest("/api/stats"))
     }
 
-    /// Lightweight heartbeat to mark worker as online (updates last_seen_at).
-    func heartbeat() async -> Bool {
-        do {
-            let req = try makeRequest("/api/me/heartbeat", method: "POST")
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                return false
-            }
-            return true
-        } catch {
-            nvpLog(.warn, "Heartbeat failed: \(error.localizedDescription)")
-            return false
-        }
+    /// Public feature flags (NVP split, wallet beta).
+    func settings() async throws -> SettingsDTO {
+        try await run(try makeRequest("/api/settings"))
     }
 
-    /// Legacy heartbeat that also fetches balance (for backwards compatibility).
-    func legacyHeartbeat() async {
+    /// Is the coordinator reachable? (pings /api/health, no auth)
+    func health() async -> Bool {
+        guard let url = URL(string: baseURL + "/api/health") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { return false }
+        return (200..<300).contains(http.statusCode)
+    }
+
+    /// Presence heartbeat + self-reported runtime state (so the coordinator can
+    /// show why a worker is/isn't pulling jobs). Falls back to a balance ping.
+    func heartbeat(state: [String: Any]? = nil) async {
+        if let state, let body = try? JSONSerialization.data(withJSONObject: state),
+           let req = try? makeRequest("/api/workers/heartbeat", method: "POST", body: body) {
+            if let (_, resp) = try? await URLSession.shared.data(for: req),
+               let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
+                return
+            }
+        }
         _ = try? await balance()
+    }
+
+    /// NVP Beta: announce this device's capability to the distributed signaling
+    /// registry so the network can place model shards on it.
+    func nexusAnnounce(peerId: String, deviceModel: String, ramGB: Double) async {
+        let body = try? JSONSerialization.data(withJSONObject: [
+            "action": "announce",
+            "peer_id": peerId,
+            "capability": [
+                "deviceName": deviceModel,
+                "availableRAM_GB": ramGB,
+                "platform": "ios",
+            ],
+            "shards": [],
+        ])
+        guard let body, let req = try? makeRequest("/api/nexus/signal", method: "POST", body: body) else { return }
+        _ = try? await URLSession.shared.data(for: req)
+    }
+
+    /// Register the worker's on-chain wallet address (for NVP withdrawals).
+    func linkWallet(address: String) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["address": address])
+        struct OK: Decodable { let ok: Bool }
+        let _: OK = try await run(try makeRequest("/api/wallet/link", method: "POST", body: body))
+    }
+
+    /// Withdraw earnings on-chain to the linked wallet. amount nil = full balance.
+    func walletWithdraw(amount: Double?) async throws -> String {
+        let payload: [String: Any] = amount != nil ? ["amount": amount!] : ["amount": "all"]
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        struct WD: Decodable { let ok: Bool; let txHash: String?; let explorerUrl: String? }
+        let r: WD = try await run(try makeRequest("/api/wallet/withdraw", method: "POST", body: body))
+        return r.txHash ?? ""
     }
 
     /// Link this worker device to a chatbot account (email + password).

@@ -37,20 +37,24 @@ jobs:
 
       # Cache compiled SwiftPM artifacts (MLX is the slow part). First run is
       # ~6-7 min; later runs reuse this and are much faster.
+      # Fixed -derivedDataPath so the cache actually maps back across runs (the
+      # default NVPNode-<random> path defeats reuse). Caching compiled package
+      # products means heavy deps (MLX/WalletCore) aren't recompiled; only changed
+      # app sources rebuild → fresh IPA, fast.
       - name: Cache SwiftPM + DerivedData
         uses: actions/cache@v4
         with:
           path: |
-            ~/Library/Developer/Xcode/DerivedData/NVPNode-*/SourcePackages
             ~/Library/Caches/org.swift.swiftpm
-            ~/Library/Developer/Xcode/DerivedData/NVPNode-*/Build/Intermediates.noindex
-          key: ${{ runner.os }}-mlx-${{ hashFiles('ios/project.yml', '.github/workflows/ios-unsigned-ipa.yml') }}
+            ~/dd/SourcePackages
+            ~/dd/Build
+          key: ${{ runner.os }}-dd-${{ hashFiles('ios/project.yml') }}
           restore-keys: |
-            ${{ runner.os }}-mlx-
+            ${{ runner.os }}-dd-
 
       - name: Resolve Swift packages (MLX)
         working-directory: ios
-        run: xcodebuild -project NVPNode.xcodeproj -resolvePackageDependencies
+        run: xcodebuild -project NVPNode.xcodeproj -scheme "$SCHEME" -derivedDataPath "$HOME/dd" -resolvePackageDependencies
 
       - name: Build unsigned archive
         run: |
@@ -58,16 +62,19 @@ jobs:
           xcodebuild \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
-            -configuration Release \
+            -configuration Debug \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/NVPNode.xcarchive" \
+            -derivedDataPath "$HOME/dd" \
             -skipPackagePluginValidation \
             archive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            COMPILER_INDEX_STORE_ENABLE=NO \
             ENABLE_USER_SCRIPT_SANDBOXING=NO
 
       - name: Package .ipa (unsigned)

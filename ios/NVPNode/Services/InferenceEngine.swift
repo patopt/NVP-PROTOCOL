@@ -12,12 +12,15 @@ struct GenResult {
 /// path build and run with zero external dependencies. The next milestone swaps
 /// in a real MLX-backed engine (Qwen2.5-0.5B natively, then the Gemma 4 E2B port)
 /// behind this same protocol — `WorkerLoop` doesn't change.
-protocol InferenceEngine {
+protocol InferenceEngine: AnyObject {
     var isLoaded: Bool { get }
+    /// Reports model download/load progress: (fraction 0...1, completedBytes, totalBytes).
+    var progressHandler: ((Double, Int64, Int64) -> Void)? { get set }
     /// Load weights + tokenizer from a local directory.
     func load(modelDir: URL?) async throws
-    /// Greedy generation for a single user prompt.
-    func generate(prompt: String, maxTokens: Int) async throws -> GenResult
+    /// Greedy generation for a single user prompt. When `reasoning` is true and the
+    /// model supports it (Gemma 4), think step-by-step before answering.
+    func generate(prompt: String, maxTokens: Int, reasoning: Bool) async throws -> GenResult
     /// Free memory when the worker goes OFF / app backgrounds.
     func unload()
 }
@@ -27,6 +30,7 @@ protocol InferenceEngine {
 /// MLX engine is wired in. Real chatbot answers require the real engine.
 final class StubInferenceEngine: InferenceEngine {
     private(set) var isLoaded = false
+    var progressHandler: ((Double, Int64, Int64) -> Void)?
 
     func load(modelDir: URL?) async throws {
         // Simulate a short load.
@@ -34,7 +38,7 @@ final class StubInferenceEngine: InferenceEngine {
         isLoaded = true
     }
 
-    func generate(prompt: String, maxTokens: Int) async throws -> GenResult {
+    func generate(prompt: String, maxTokens: Int, reasoning: Bool) async throws -> GenResult {
         let start = Date()
         // Pretend to think briefly, scaled by requested length.
         try? await Task.sleep(nanoseconds: 150_000_000)

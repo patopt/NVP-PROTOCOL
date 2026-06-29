@@ -1,4 +1,5 @@
 name: NVPNode
+# Gemma 4 E2B on-device via Gemma4SwiftCore (mlx-swift-lm 2.30.x).
 options:
   bundleIdPrefix: com.nvp
   deploymentTarget:
@@ -15,15 +16,24 @@ settings:
     CODE_SIGN_STYLE: Manual
 
 packages:
-  mlx-swift-lm:
-    url: https://github.com/ml-explore/mlx-swift-lm
-    exactVersion: "2.30.6"
-  mlx-swift:
-    url: https://github.com/ml-explore/mlx-swift
-    from: "0.30.3"
-  gemma4-swift-core:
-    url: https://github.com/yejingyang8963-byte/Swift-gemma4-core.git
-    from: "0.1.0"
+  # Trust Wallet Core — BIP39 mnemonic, HD keys, Ethereum signing (NVP wallet).
+  WalletCore:
+    url: https://github.com/trustwallet/wallet-core
+    from: "4.2.9"
+  # swift-transformers — tokenizer for the NVP-D distributed pipeline.
+  # Pinned to 1.1.x so it co-resolves with the engine SDK's WhisperKit dependency.
+  swift-transformers:
+    url: https://github.com/huggingface/swift-transformers
+    minVersion: "1.1.6"
+    maxVersion: "1.2.0"
+  # ZIPFoundation — unzip the CoreML shard archives downloaded for NVP-D split mode.
+  ZIPFoundation:
+    url: https://github.com/weichsel/ZIPFoundation
+    from: "0.9.0"
+  # Apple ml-stable-diffusion — on-device image generation (Core ML).
+  ml-stable-diffusion:
+    url: https://github.com/apple/ml-stable-diffusion
+    from: "1.1.0"
 
 targets:
   NVPNode:
@@ -32,20 +42,33 @@ targets:
     sources:
       - path: NVPNode
     dependencies:
-      - package: mlx-swift-lm
-        product: MLXLLM
-      - package: mlx-swift-lm
-        product: MLXLMCommon
-      - package: mlx-swift
-        product: MLX
-      - package: gemma4-swift-core
-        product: Gemma4SwiftCore
+      - package: swift-transformers
+        product: Tokenizers
+      - package: swift-transformers
+        product: Hub
+      - package: ZIPFoundation
+        product: ZIPFoundation
+      - package: WalletCore
+        product: WalletCore
+      - package: WalletCore
+        product: WalletCoreSwiftProtobuf
+      - package: ml-stable-diffusion
+        product: StableDiffusion
+      # Vendored llama.cpp (GGUF engine) — slim xcframework committed in-repo so
+      # the build is fast and self-contained (no fragile remote SDK / checksums).
+      - framework: Frameworks/llama.xcframework
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nvp.node
         CODE_SIGN_ENTITLEMENTS: NVPNode/NVPNode.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: NVP Node
+        # Expose the app's Documents folder in the Files app (auto-created folder
+        # named after the app) so users can copy models/shards in and out.
+        INFOPLIST_KEY_UIFileSharingEnabled: YES
+        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
       # The coordinator should be served over HTTPS (e.g. Vercel); iOS ATS
