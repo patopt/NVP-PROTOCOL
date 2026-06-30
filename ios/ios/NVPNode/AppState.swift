@@ -1,0 +1,689 @@
+import Foundation
+import Combine
+import CryptoKit
+import UIKit
+import UserNotifications
+
+@MainActor
+final class AppState: ObservableObject {
+    private var cancellables = Set<AnyCancellable>()
+    // Registration
+    @Published var workerId: String?
+    @Published var isRegistered = false
+
+    // Worker runtime
+    @Published var isWorker = false
+    @Published var status = "idle"
+    @Published var lastLatencyMs = 0
+    @Published var jobsToday = 0
+    @Published var creditsToday = 0.0
+    @Published var queueDepth = 0          // jobs waiting in the local queue
+    @Published var tokensPerSec = 0.0      // last job decode speed
+    @Published var errorMessage: String?
+
+    // Earnings
+    @Published var balance = 0.0
+    @Published var jobsDone = 0
+    @Published var ledger: [LedgerEntry] = []
+    @Published var payoutsList: [Payout] = []
+
+    // Catalog
+    @Published var models: [ModelDTO] = []
+
+    // Linked chatbot account (email), if any.
+    @Published var linkedEmail: String? = UserDefaults.standard.string(forKey: "linked_email")
+
+    // Live network + activity (for the animated Network view)
+    @Published var networkOnline = 0
+    @Published var networkTotal = 0
+    @Published var networkTops = 0
+    @Published var liveTokps = 0.0
+    @Published var activity: WorkerActivity = .idle
+    @Published var loadProgress: Double = 0 // model download/load 0...1
+    @Published var isPreloading = false
+    @Published var connected = false // coordinator reachable?
+    @Published var downloadMB: Double = 0
+    @Published var downloadTotalMB: Double = 0
+    @Published var downloadSpeedMBs: Double = 0
+    @Published var loadingIntoMemory = false // download done, initializing weights
+    // NVP OS (beta): simulated iOS-like desktop inside the app.
+  @Published var nvpOSOn = Config.nvpOSEnabled
+  @Published var showNVPOS = false
+  func setNvpOS(_ on: Bool) { Config.nvpOSEnabled = on; nvpOSOn = on; if !on { showNVPOS = false }; objectWillChange.send() }
+
+  // Image generation (additive): chat LLM + Stable Diffusion, separate engines.
+    @Published var imageGenOn = Config.imageGenEnabled
+    @Published var imageDownloading = false
+    @Published var imageProgress: Double = 0
+    @Published var imageInstalled = ImageEngine.isDownloaded(Config.imageModelId)
+    private let imagePrefetch = ImageEngine()
+    @Published var nvpEnabled = false // NVP split protocol active (admin)
+    @Published var walletBetaEnabled = false // wallet beta allowed (admin)
+    @Published var nvpBetaOn = Config.nvpBetaEnabled // user joined distributed compute
+    @Published var nexusPeerCount = 0 // peers online in the NVP-D network
+    @Published var nvpServedModels: [String] = [] // NVP-D models this device has shards for
+    @Published var nvpPowerTops = 0 // rough Neural Engine TOPS estimate
+    private var nvpModelShards: [String: Int] = [:] // model id → shard count
+    private var nexusWorker: NexusWorker? // serves shard steps to peers (NVP mode)
+    private var nvpJobLoop: Task<Void, Never>? // claims + runs NVP-D jobs (NVP mode)
+    private let nexus = NexusClient()
+    private var nvpBaselineSet = false // first settings poll establishes baseline
+    private var dlLastMB: Double = 0
+    private var dlLastTime: Date?
+    private var dlLastLog: Date?
+
+    private var statsTask: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>?
+
+    let deviceState = DeviceState()
+    private var api: APIClient
+    // Real on-device inference (MLX). Swap to StubInferenceEngine() only to test
+    // the loop without loading a model.
+    private let engine: InferenceEngine = LlamaEngine()
+    private var loop: WorkerLoop?
+
+    init() {
+        let key = KeychainStore.get(KeychainStore.apiKeyKey)
+        api = APIClient(baseURL: Config.coordinatorURL, apiKey: key)
+        workerId = KeychainStore.get(KeychainStore.workerIdKey)
+        isRegistered = (key != nil && workerId != nil)
+
+        // Re-render views observing AppState when device conditions change
+        // (charging / thermal / foreground).
+        deviceState.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
+        engine.progressHandler = { [weak self] frac, done, total in
+            Task { @MainActor in self?.onDownloadProgress(frac, done, total) }
+        }
+        startStatsPolling()
+        startConnectivityPolling()
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        if isRegistered { Task { try? await loadModels() } }
+    }
+
+    /// Local notification fired when the admin turns the NVP protocol ON.
+    private func notifyNVPActivated() {
+        nvpLog(.success, "NVP Protocol activated by the network")
+        let content = UNMutableNotificationContent()
+        content.title = "NVP Protocol activated"
+        content.body = "Your iPhone is now part of the distributed NVP network (answers split across devices)."
+        content.sound = .default
+        let req = UNNotificationRequest(
+            identifier: "nvp-activated-\(Int(Date().timeIntervalSince1970))",
+            content: content,
+            trigger: nil,
+        )
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    /// Ping the coordinator so the UI can show connected/unreachable clearly.
+    private func startConnectivityPolling() {
+        Task { [weak self] in
+            while !Task.isCancelled {
+                let ok = await self?.api.health() ?? false
+                await MainActor.run { self?.connected = ok }
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+            }
+        }
+    }
+
+    /// Change the on-device model the worker runs. Reloads the engine on the
+    /// next loop iteration and advertises the new model to the coordinator.
+    func setWorkerModel(_ id: String) {
+        let previous = Config.effectiveModelId
+        Config.workerModelId = id
+        // Only drop the loaded model if the *effective* model actually changed —
+        // avoids unloading/reloading (a memory spike) mid-work when re-selecting
+        // the same model.
+        if Config.effectiveModelId != previous {
+            engine.unload()
+            nvpLog(.info, "Switched on-device model to \(Config.effectiveModelId)")
+        }
+        objectWillChange.send()
+    }
+
+    /// Download + load a model now (from Settings), with visible progress —
+    /// independent of the worker toggle. Lets the user pre-install models.
+    func preloadModel(_ id: String) {
+        guard !isPreloading else { return }
+        setWorkerModel(id)
+        isPreloading = true
+        activity = .loadingModel
+        loadProgress = 0
+        downloadMB = 0
+        downloadSpeedMBs = 0
+        downloadTotalMB = Config.declaredMB(Config.effectiveModelId)
+        loadingIntoMemory = false
+        dlLastMB = 0
+        dlLastTime = nil
+        errorMessage = nil
+        nvpLog(.info, "Downloading model \(Config.effectiveModelId)…")
+        Task {
+            do {
+                try await engine.load(modelDir: nil)
+                nvpLog(.success, "Model ready: \(Config.effectiveModelId)")
+            } catch {
+                errorMessage = "Download failed: \(error.localizedDescription)"
+                nvpLog(.error, "Download failed: \(error.localizedDescription)")
+            }
+            isPreloading = false
+            loadingIntoMemory = false
+            activity = .idle
+            objectWillChange.send()
+        }
+    }
+
+    /// Enable/disable image generation (additive capability). When ON, the worker
+    /// advertises the image model alongside its chat LLM (two separate engines).
+    func setImageGen(_ on: Bool) {
+        Config.imageGenEnabled = on
+        imageGenOn = on
+        nvpLog(.info, on ? "Image generation enabled — advertising \(Config.effectiveImageModelId)" : "Image generation disabled")
+        // Re-announce capabilities so chat sees the image model online right away.
+        Task { try? await api.register(devicePubkey: devicePublicKey()) }
+        objectWillChange.send()
+    }
+
+    /// Download the Stable Diffusion image model now (visible progress), so the
+    /// worker can serve image jobs without waiting on the first request.
+    func downloadImageModel() {
+        guard !imageDownloading else { return }
+        imageDownloading = true
+        imageProgress = 0
+        errorMessage = nil
+        let id = Config.effectiveImageModelId
+        let repo = Config.imageRepo(for: id)
+        nvpLog(.info, "Downloading image model \(id)…")
+        Task {
+            do {
+                try await imagePrefetch.load(id: id, repo: repo) { frac, _, _ in
+                    Task { @MainActor in self.imageProgress = frac }
+                }
+                imageInstalled = true
+                nvpLog(.success, "Image model ready: \(id)")
+            } catch {
+                errorMessage = "Image download failed: \(error.localizedDescription)"
+                nvpLog(.error, "Image download failed: \(error.localizedDescription)")
+            }
+            imageDownloading = false
+            objectWillChange.send()
+        }
+    }
+
+    /// Poll public network stats so the Network view always shows live counts.
+    private func startStatsPolling() {
+        statsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                if let s = try? await self?.api.stats() {
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.networkOnline = s.devicesOnline
+                        self.networkTotal = s.devicesTotal
+                        self.networkTops = s.combinedTops
+                        self.liveTokps = s.liveTokensPerSec
+                    }
+                }
+                if let f = try? await self?.api.settings() {
+                    await MainActor.run {
+                        guard let self else { return }
+                        let wasOn = self.nvpEnabled
+                        self.nvpEnabled = f.nvpSplitEnabled
+                        self.walletBetaEnabled = f.walletBetaEnabled
+                        // Notify the owner when the admin switches NVP ON (skip the
+                        // first poll, which just establishes the baseline).
+                        if self.nvpBaselineSet, !wasOn, f.nvpSplitEnabled {
+                            self.notifyNVPActivated()
+                        }
+                        self.nvpBaselineSet = true
+                    }
+                }
+                // NVP Beta: announce this device + count peers in the network.
+                if Config.nvpBetaEnabled, let self {
+                    let name = await MainActor.run { UIDevice.current.model }
+                    await self.nexus.announce(peerId: Config.peerId, deviceName: name, ramGB: Config.deviceRamGB, shards: [])
+                    let peers = await self.nexus.peers()
+                    await MainActor.run { self.nexusPeerCount = peers.count }
+                }
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+            }
+        }
+    }
+
+    /// Toggle NVP Beta (distributed compute participation).
+    func setNvpBeta(_ on: Bool) {
+        Config.nvpBetaEnabled = on
+        nvpBetaOn = on
+        nvpPowerTops = on ? estimateTops() : 0
+        nvpLog(.info, on ? "NVP Beta ON — distributed mode (local models disabled)" : "NVP Beta OFF — local mode")
+        // If the worker is running, switch it into/out of NVP mode immediately.
+        if isWorker {
+            Task {
+                await stopLoop(); await stopNVPMode()
+                if on { startNVPMode() } else { startLoop() }
+            }
+        } else if on {
+            Task { await api.nexusAnnounce(peerId: Config.peerId, deviceModel: UIDevice.current.model, ramGB: Config.deviceRamGB)
+                   await refreshServedModels() }
+        }
+    }
+
+    /// Rebuild the API client (e.g. after the coordinator URL changes in Settings).
+    func rebuildClient() {
+        api = APIClient(baseURL: Config.coordinatorURL, apiKey: KeychainStore.get(KeychainStore.apiKeyKey))
+    }
+
+    /// Live download progress -> MB + speed, with periodic log lines.
+    /// The MLX downloader often reports only a fraction (no byte counts), so we
+    /// estimate MB from the model's known size.
+    private func onDownloadProgress(_ frac: Double, _ done: Int64, _ total: Int64) {
+        loadProgress = frac
+        let mb = 1_048_576.0
+        let totalMB = total > 0 ? Double(total) / mb : Config.declaredMB(Config.effectiveModelId)
+        downloadTotalMB = totalMB
+        downloadMB = total > 0 ? Double(done) / mb : frac * totalMB
+        // Download finished, now loading weights into GPU memory (no progress).
+        loadingIntoMemory = frac >= 0.999
+
+        let now = Date()
+        if let t = dlLastTime {
+            let dt = now.timeIntervalSince(t)
+            if dt > 0.5 {
+                downloadSpeedMBs = max(0, (downloadMB - dlLastMB) / dt)
+                dlLastMB = downloadMB
+                dlLastTime = now
+            }
+        } else {
+            dlLastMB = downloadMB
+            dlLastTime = now
+        }
+        if dlLastLog == nil || now.timeIntervalSince(dlLastLog!) > 1.0 {
+            dlLastLog = now
+            if loadingIntoMemory {
+                nvpLog(.info, "Download complete — loading model into memory (can take 1-2 min)…")
+            } else {
+                nvpLog(.info, String(format: "Downloading %.0f/%.0f MB · %.1f MB/s (%.0f%%)",
+                                     downloadMB, downloadTotalMB, downloadSpeedMBs, frac * 100))
+            }
+        }
+    }
+
+    /// Deterministic wallet address derived from the device key (beta; off-chain).
+    /// When real testnet NVP lands, this becomes the on-chain address.
+    var walletAddress: String {
+        guard let raw = KeychainStore.get(KeychainStore.devicePrivKey),
+              let data = Data(base64Encoded: raw),
+              let priv = try? Curve25519.Signing.PrivateKey(rawRepresentation: data)
+        else { return "—" }
+        let pub = priv.publicKey.rawRepresentation
+        return "nvp1" + pub.prefix(20).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Wallet is usable only if the user opted in AND the admin allows it.
+    var walletActive: Bool { Config.walletBetaActive && walletBetaEnabled }
+
+    /// Ping the coordinator (onboarding before registering).
+    func checkHealth() async -> Bool {
+        let ok = await api.health()
+        connected = ok
+        return ok
+    }
+
+    // MARK: Registration
+
+    func register() async {
+        errorMessage = nil
+        do {
+            let pubkey = devicePublicKey()
+            let res = try await api.register(devicePubkey: pubkey)
+            KeychainStore.set(res.apiKey, for: KeychainStore.apiKeyKey)
+            KeychainStore.set(res.workerId, for: KeychainStore.workerIdKey)
+            api.setApiKey(res.apiKey)
+            workerId = res.workerId
+            isRegistered = true
+            nvpLog(.success, "Registered worker \(res.workerId)")
+            try? await loadModels()
+        } catch {
+            errorMessage = error.localizedDescription
+            nvpLog(.error, "Registration failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func devicePublicKey() -> String {
+        if let raw = KeychainStore.get(KeychainStore.devicePrivKey),
+           let data = Data(base64Encoded: raw),
+           let priv = try? Curve25519.Signing.PrivateKey(rawRepresentation: data) {
+            return "ed25519:" + priv.publicKey.rawRepresentation.base64EncodedString()
+        }
+        let priv = Curve25519.Signing.PrivateKey()
+        KeychainStore.set(priv.rawRepresentation.base64EncodedString(), for: KeychainStore.devicePrivKey)
+        return "ed25519:" + priv.publicKey.rawRepresentation.base64EncodedString()
+    }
+
+    func loadModels() async throws {
+        models = try await api.models()
+    }
+
+    // MARK: Worker toggle
+
+    func setWorker(_ on: Bool) {
+        isWorker = on
+        // Keep the screen awake while working so the (large) model download and
+        // inference aren't cancelled by auto-lock / backgrounding.
+        UIApplication.shared.isIdleTimerDisabled = on
+        nvpLog(.info, on ? "Worker turned ON (screen kept awake)" : "Worker turned OFF")
+        if on {
+            // NVP mode: serve/run distributed shards ONLY (no local MLX model).
+            if nvpBetaOn { startNVPMode() } else { startLoop() }
+        } else {
+            Task { await stopLoop(); await stopNVPMode() }
+        }
+    }
+
+    /// Rough Neural Engine throughput (TOPS) for the power display.
+    private func estimateTops() -> Int {
+        let gb = Config.deviceRamGB
+        if gb >= 7.5 { return 35 } else if gb >= 5.5 { return 17 } else { return 11 }
+    }
+
+    /// NVP-D worker mode: serve shard steps to peers + claim/run NVP-D jobs locally
+    /// via the CoreML pipeline. The local MLX model is NOT loaded in this mode.
+    private func startNVPMode() {
+        status = "NVP mode"
+        nvpPowerTops = estimateTops()
+        nvpLog(.success, "NVP-D mode ON — serving distributed shards (local model disabled)")
+        let worker = NexusWorker(modelId: "")
+        nexusWorker = worker
+        Task { await worker.start() }
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled { await self?.api.heartbeat(state: self?.workerStateReport()); try? await Task.sleep(nanoseconds: 20_000_000_000) }
+        }
+        nvpJobLoop = Task { [weak self] in await self?.runNVPLoop() }
+    }
+
+    private func stopNVPMode() async {
+        nvpJobLoop?.cancel(); nvpJobLoop = nil
+        heartbeatTask?.cancel(); heartbeatTask = nil
+        await nexusWorker?.stop(); nexusWorker = nil
+        if status == "NVP mode" { status = "idle" }
+        activity = .idle
+    }
+
+    /// Refresh which distributed models this device can serve (shards installed).
+    func refreshServedModels() async {
+        let raw = await nexus.manifests()
+        var served: [String] = []
+        var shardsMap: [String: Int] = [:]
+        for e in raw {
+            guard let id = e["modelId"] as? String else { continue }
+            let man = e["manifest"] as? [String: Any] ?? [:]
+            let shards = (man["shards"] as? [[String: Any]])?.count ?? 0
+            if shards > 0, NexusShardStore.installedShardCount(modelId: id, total: shards) == shards {
+                served.append(id); shardsMap[id] = shards
+            }
+        }
+        nvpServedModels = served
+        nvpModelShards = shardsMap
+    }
+
+    /// "<modelId>:<shard>" tokens for every shard this device has on disk.
+    private func myShardTokens() -> [String] {
+        var tokens: [String] = []
+        for (id, n) in nvpModelShards {
+            for i in 0..<n where NexusShardStore.shardURL(modelId: id, shard: i) != nil { tokens.append("\(id):\(i)") }
+        }
+        return tokens
+    }
+
+    private func runNVPLoop() async {
+        while !Task.isCancelled {
+            guard isWorker, nvpBetaOn else { break }
+            await refreshServedModels()
+            // Announce capability (RAM + the exact shards we hold) to the registry.
+            await nexus.announce(peerId: Config.peerId, deviceName: UIDevice.current.model,
+                                 ramGB: Config.deviceRamGB, shards: myShardTokens())
+            let served = nvpServedModels
+            if served.isEmpty { activity = .waiting; try? await Task.sleep(nanoseconds: 3_000_000_000); continue }
+            do {
+                activity = .waiting
+                if let job = try await api.nextJob(models: served) {
+                    activity = .receivedJob
+                    nvpLog(.info, "NVP job \(job.jobId) for \(job.model)")
+                    let shards = nvpModelShards[job.model] ?? 1
+                    let maxTokens = min(Config.maxTokensCap, job.params?.maxTokens ?? Config.defaultMaxTokens)
+                    let t0 = Date()
+                    activity = .inferring
+                    let output = await runNVP(modelId: job.model, prompt: job.prompt, shards: shards, maxTokens: maxTokens)
+                    let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                    activity = .submitting
+                    let res = try await api.submitResult(jobId: job.jobId, output: output, latencyMs: ms, tokensOut: max(1, output.count / 4))
+                    nvpLog(res.accepted ? .success : .warn, res.accepted ? "NVP result accepted" : "NVP result rejected")
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+        }
+    }
+
+    /// Assign each shard of `modelId` to a peer that holds it, spreading shards
+    /// across remote peers (round-robin) for a real multi-device split, falling
+    /// back to this device when no peer serves a given shard.
+    private func buildAssignment(modelId: String, shards: Int) async -> (assignment: [Int: String], remote: Int) {
+        let me = Config.peerId
+        let peers = await nexus.peers()
+        var assignment: [Int: String] = [:]
+        var rr = 0
+        var remoteCount = 0
+        for i in 0..<max(1, shards) {
+            let token = "\(modelId):\(i)"
+            let holders = peers.filter { $0.shards.contains(token) }.map { $0.peerId }
+            let remote = holders.filter { $0 != me }
+            let haveLocal = NexusShardStore.shardURL(modelId: modelId, shard: i) != nil
+            if !remote.isEmpty {
+                assignment[i] = remote[rr % remote.count]; rr += 1; remoteCount += 1
+            } else if haveLocal {
+                assignment[i] = me
+            } else if let any = holders.first {
+                assignment[i] = any; remoteCount += 1
+            } else {
+                assignment[i] = me // best effort
+            }
+        }
+        return (assignment, remoteCount)
+    }
+
+    /// Run one NVP-D inference, splitting the model's shards across peers + self.
+    private func runNVP(modelId: String, prompt: String, shards: Int, maxTokens: Int) async -> String {
+        let pipeline = NexusPipeline()
+        let local = NexusWorkerLocal(modelId: modelId)
+        let idx = Array(0..<max(1, shards))
+        let (assignment, remote) = await buildAssignment(modelId: modelId, shards: shards)
+        nvpLog(.info, "Split: \(shards) shards · \(remote) on remote peers · \(shards - remote) local")
+        let stream = await pipeline.run(prompt: prompt, modelId: modelId, shardIndices: idx,
+                                        assignment: assignment, local: local, maxTokens: maxTokens)
+        var out = ""
+        for await piece in stream { out += piece }
+        return out
+    }
+
+    private func startLoop() {
+        let loop = WorkerLoop(api: api, engine: engine, models: { Config.modelCaps })
+        self.loop = loop
+        status = "working"
+        Task {
+            await loop.start(
+                shouldRun: { [weak self] in
+                    await MainActor.run { (self?.deviceState.canWork ?? false) && (self?.isWorker ?? false) }
+                },
+                onStatus: { [weak self] msg in await MainActor.run { self?.status = msg } },
+                onActivity: { [weak self] act in await MainActor.run { self?.activity = act } },
+                onQueue: { [weak self] depth in await MainActor.run { self?.queueDepth = depth } },
+                onJob: { [weak self] outcome in await self?.handleJob(outcome) },
+                onError: { [weak self] msg in await MainActor.run { self?.errorMessage = msg } }
+            )
+        }
+        // Presence heartbeat (keeps us "online" even while the model downloads).
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.api.heartbeat(state: self?.workerStateReport())
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+            }
+        }
+    }
+
+    /// Self-reported runtime state for the coordinator (debug why a worker isn't
+    /// pulling jobs). Surfaced in /api/stats → online_devices[].state.
+    @MainActor
+    func workerStateReport() -> [String: Any] {
+        [
+            "is_worker": isWorker,
+            "foreground": deviceState.canWork,
+            "engine_loaded": engine.isLoaded,
+            "mode": nvpBetaOn ? "nvp" : "local",
+            "model": Config.effectiveModelId,
+        ]
+    }
+
+    private func stopLoop() async {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        await loop?.stop()
+        loop = nil
+        status = "idle"
+        activity = .idle
+        queueDepth = 0
+    }
+
+    private func handleJob(_ o: JobOutcome) {
+        lastLatencyMs = o.latencyMs
+        tokensPerSec = o.tokensPerSec
+        if o.accepted {
+            jobsToday += 1
+            creditsToday += o.credited
+            balance = o.balance
+        }
+    }
+
+    // MARK: Earnings
+
+    func refreshEarnings() async {
+        do {
+            let b = try await api.balance()
+            balance = b.balance
+            jobsDone = b.jobsDone
+            ledger = try await api.ledger()
+            payoutsList = try await api.payouts()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func requestPayout(amount: Double) async -> Bool {
+        do {
+            _ = try await api.requestPayout(amount: amount)
+            await refreshEarnings()
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    // MARK: Recovery key (reconnect on another device)
+
+    /// Human-readable recovery file contents (contains the device API key).
+    var recoveryString: String? {
+        guard let key = KeychainStore.get(KeychainStore.apiKeyKey),
+              let wid = KeychainStore.get(KeychainStore.workerIdKey) else { return nil }
+        return """
+        NVP NODE — RECOVERY KEY
+        Keep this private. It reconnects your worker account (and earnings) on another device.
+
+        worker_id=\(wid)
+        api_key=\(key)
+        """
+    }
+
+    /// Restore an account from a pasted/imported recovery key.
+    func restore(from text: String) async -> Bool {
+        errorMessage = nil
+        func field(_ name: String) -> String? {
+            for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+                let s = line.trimmingCharacters(in: .whitespaces)
+                if s.hasPrefix("\(name)=") { return String(s.dropFirst(name.count + 1)).trimmingCharacters(in: .whitespaces) }
+            }
+            return nil
+        }
+        let key = field("api_key") ?? (text.contains("nvp_live_") ? text.trimmingCharacters(in: .whitespacesAndNewlines) : nil)
+        let wid = field("worker_id")
+        guard let apiKey = key, apiKey.hasPrefix("nvp_live_") else {
+            errorMessage = "Invalid recovery key"
+            return false
+        }
+        KeychainStore.set(apiKey, for: KeychainStore.apiKeyKey)
+        if let wid { KeychainStore.set(wid, for: KeychainStore.workerIdKey) }
+        rebuildClient()
+        // Validate by fetching balance.
+        do {
+            let b = try await api.balance()
+            balance = b.balance
+            jobsDone = b.jobsDone
+            workerId = wid ?? KeychainStore.get(KeychainStore.workerIdKey)
+            isRegistered = true
+            nvpLog(.success, "Account restored from recovery key")
+            return true
+        } catch {
+            errorMessage = "Recovery key not accepted by coordinator"
+            KeychainStore.delete(KeychainStore.apiKeyKey)
+            return false
+        }
+    }
+
+    // MARK: Link to chatbot account
+
+    func linkAccount(email: String, password: String) async -> Bool {
+        errorMessage = nil
+        do {
+            _ = try await api.link(email: email, password: password)
+            linkedEmail = email
+            UserDefaults.standard.set(email, forKey: "linked_email")
+            nvpLog(.success, "Linked to chatbot account \(email)")
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    // MARK: NVP wallet (on-chain)
+
+    /// Register the on-chain wallet address so earnings can be withdrawn to it.
+    func linkWalletAddress(_ address: String) async -> Bool {
+        do { try await api.linkWallet(address: address); return true }
+        catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    /// Withdraw off-chain earnings as real NVP to the linked wallet. Returns tx hash.
+    func withdrawEarnings(amount: Double?) async -> String? {
+        do {
+            let tx = try await api.walletWithdraw(amount: amount)
+            await refreshEarnings()
+            return tx
+        } catch { errorMessage = error.localizedDescription; return nil }
+    }
+
+    func signOut() {
+        KeychainStore.delete(KeychainStore.apiKeyKey)
+        KeychainStore.delete(KeychainStore.workerIdKey)
+        isRegistered = false
+        workerId = nil
+        isWorker = false
+        linkedEmail = nil
+        UserDefaults.standard.removeObject(forKey: "linked_email")
+        UIApplication.shared.isIdleTimerDisabled = false
+        Task { await stopLoop() }
+    }
+}
